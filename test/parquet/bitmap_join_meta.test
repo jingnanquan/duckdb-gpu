@@ -1,0 +1,43 @@
+# name: test/parquet/bitmap_join_meta.test
+# description: Bitmap-Join catalog metadata PRAGMAs (design doc 6.2) and hook default path (6.3)
+# group: [parquet]
+
+require parquet
+
+# the diagnostic PRAGMA is callable (rows depend on global state; just check it runs)
+statement ok
+PRAGMA bitmap_join_meta;
+
+# load bindings from a JSON fixture produced by add_bitmap_columns.py
+statement ok
+PRAGMA bitmap_join_load('test/parquet/bitmap_join_meta_fixture.json');
+
+# the loaded PK binding is visible in the dump
+query TTI
+SELECT kind, rowid_or_ref_column, row_count FROM pragma_bitmap_join_meta() WHERE table_name='region_fix';
+----
+pk	rk	7
+
+# the loaded FK binding is visible in the dump
+query TTTT
+SELECT kind, column_name, rowid_or_ref_column, pk_table FROM pragma_bitmap_join_meta() WHERE table_name='nation_fix';
+----
+fk	rk	rk_ref	region_fix
+
+# the default execution path is unaffected by the presence of metadata
+statement ok
+CREATE TABLE dim(id INTEGER, name VARCHAR);
+
+statement ok
+CREATE TABLE fact(id_ref INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dim VALUES (0,'a'),(1,'b');
+
+statement ok
+INSERT INTO fact VALUES (0,10),(1,20),(0,30);
+
+query I
+SELECT count(*) FROM fact JOIN dim ON fact.id_ref = dim.id;
+----
+3

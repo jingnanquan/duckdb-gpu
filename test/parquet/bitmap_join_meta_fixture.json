@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "rowid_column_default": "_rowid",
+  "ref_column_suffix": "_ref",
+  "pk_bindings": [
+    {"pk_table": "region_fix", "pk_column": "rk", "rowid_column": "rk", "rowid_offset": 0, "row_count": 7}
+  ],
+  "fk_bindings": [
+    {"fk_table": "nation_fix", "fk_column": "rk", "ref_column": "rk_ref", "pk_table": "region_fix", "pk_column": "rk"}
+  ]
+}

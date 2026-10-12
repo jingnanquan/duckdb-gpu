@@ -1,0 +1,12 @@
+# pk_table,pk_col,fk_table,fk_col
+# TPC-H standard PK/FK constraints
+pk_table,pk_col,fk_table,fk_col
+region,r_regionkey,nation,n_regionkey
+nation,n_nationkey,customer,c_nationkey
+nation,n_nationkey,supplier,s_nationkey
+customer,c_custkey,orders,o_custkey
+orders,o_orderkey,lineitem,l_orderkey
+part,p_partkey,lineitem,l_partkey
+part,p_partkey,partsupp,ps_partkey
+supplier,s_suppkey,lineitem,l_suppkey
+supplier,s_suppkey,partsupp,ps_suppkey

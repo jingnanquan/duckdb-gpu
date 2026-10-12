@@ -1,0 +1,21 @@
+CompileFlags:
+  # 指向生成的编译数据库（相对路径，基于本 .clangd 所在目录解析）
+  CompilationDatabase: .cache/clangd
+  # 明确使用 GCC 8 的驱动，确保 clangd 能正确发现 libstdc++ 系统头文件
+  Compiler: /usr/bin/c++
+  Add:
+    - -Wno-unqualified-std-cast-call
+    - -Wno-c++11-extensions
+
+Diagnostics:
+  UnusedIncludes: None
+  ClangTidy:
+    # Unity Build 会 #include ".cpp" 文件，关闭该噪音检查（不影响跳转）
+    Remove:
+      - bugprone-suspicious-include
+
+Index:
+  # 构建项目级背景索引，使跨文件的“跳转到定义 / 查找引用”可用
+  Background: Build
+  # 索引标准库，使 STL 类型也能跳转（注意：必须为布尔值 true，不能用 Yes）
+  StandardLibrary: true
