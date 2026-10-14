@@ -7,7 +7,13 @@
 # 来切换到官方 libduckdb.so (同一二进制, 两种 baseline)。
 set -euo pipefail
 
-BASE_DIR="/home/featurize/workspace/duckdb-cuda"
+# 仓库根目录: 由仓库根目录 gpu_paths.conf 的 base_dir 决定 (换机器只改那一行)
+_gp_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ ! -f "$_gp_root/gpu_paths.sh" ] && [ "$_gp_root" != "/" ]; do
+    _gp_root="$(dirname "$_gp_root")"
+done
+. "$_gp_root/gpu_paths.sh"     # 提供 $BASE_DIR
+
 SRC_DIR="$BASE_DIR/b_idea/perf/tpche2e"
 INC_DIR="$BASE_DIR/src/include"
 LIB_DIR="$BASE_DIR/build/release/src"   # 默认链接项目 (bitmap) libduckdb.so

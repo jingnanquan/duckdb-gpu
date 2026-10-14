@@ -18,7 +18,7 @@ tpche2e_bench.py — TPC-H 22 条查询端到端 (e2e) 性能对比脚本
   - tpche2e_speedup.png          每条查询的加速比 (official_avg / bitmap_avg)
 
 用法示例:
-  cd /home/featurize/workspace/duckdb-cuda
+  cd <base_dir>        # gpu_paths.conf 里的 base_dir (python3 gpu_paths.py 可查看)
   python3 b_idea/perf/tpche2e/tpche2e_bench.py
   # 只跑官方版 / 只跑 bitmap 版
   python3 b_idea/perf/tpche2e/tpche2e_bench.py --official-only
@@ -43,7 +43,12 @@ import zipfile
 # ============================================================
 # 路径 / 版本配置 (均可被命令行参数覆盖)
 # ============================================================
-BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
+# 仓库根目录: 由仓库根目录 gpu_paths.conf 的 base_dir 决定 (换机器只改那一行)
+_gp_root = os.path.dirname(os.path.abspath(__file__))
+while not os.path.isfile(os.path.join(_gp_root, "gpu_paths.py")) and os.path.dirname(_gp_root) != _gp_root:
+    _gp_root = os.path.dirname(_gp_root)
+sys.path.insert(0, _gp_root)
+from gpu_paths import BASE_DIR  # noqa: E402
 DATA_DIR = os.path.join(BASE_DIR, "data", "tpch_sf5_bitmap")
 META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
 PROJECT_CLI = os.path.join(BASE_DIR, "build", "release", "duckdb")

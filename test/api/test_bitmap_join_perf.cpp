@@ -9,10 +9,11 @@
 // and the result rows are required to match exactly across paths.
 //
 // The SF=5 parquet files (and the bitmap_join_meta.json) live at:
-//   /home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap/
+//   <base_dir>/data/tpch_sf5_bitmap/     (base_dir = gpu_paths.conf, see test/include/gpu_paths.hpp)
 // If that directory is not present (e.g. CI without the dataset) the test is skipped.
 
 #include "catch.hpp"
+#include "gpu_paths.hpp"
 #include "test_helpers.hpp"
 
 #include "duckdb.hpp"
@@ -30,7 +31,11 @@ using namespace std;
 
 namespace {
 
-constexpr const char *kDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap";
+// 数据集根目录由 gpu_paths.conf 的 base_dir 决定 (换机器只改那一行)。
+const string &DataDir() {
+	static const string dir = gpu_paths::Join("data/tpch_sf5_bitmap");
+	return dir;
+}
 
 // Build the test query. We deliberately keep it as a single equi-join INNER join with the
 // dimension table on the build side so all three execution paths apply.
@@ -43,10 +48,10 @@ string MakeQuery() {
 	       "       sum(l_extendedprice) AS sum_price, "
 	       "       sum(p_size) AS sum_size "
 	       "FROM read_parquet('" +
-	       string(kDataDir) +
+	       string(DataDir()) +
 	       "/lineitem.parquet') li "
 	       "JOIN read_parquet('" +
-	       string(kDataDir) +
+	       string(DataDir()) +
 	       "/part.parquet') p "
 	       "ON li.l_partkey = p.p_partkey;";
 }
@@ -120,12 +125,12 @@ TEST_CASE("Bitmap-Join (BHJ) vs Perfect-Hash vs DuckDB hash join (TPCH SF=5 parq
 	// Skip silently if the SF=5 parquet dataset is not present.
 	{
 		auto fs = FileSystem::CreateLocal();
-		if (!fs->DirectoryExists(kDataDir)) {
-			std::cerr << "[bitmap-join-perf] dataset directory '" << kDataDir
+		if (!fs->DirectoryExists(DataDir())) {
+			std::cerr << "[bitmap-join-perf] dataset directory '" << DataDir()
 			          << "' not found - skipping test." << std::endl;
 			return;
 		}
-		const string meta_path = string(kDataDir) + "/bitmap_join_meta.json";
+		const string meta_path = string(DataDir()) + "/bitmap_join_meta.json";
 		if (!fs->FileExists(meta_path)) {
 			std::cerr << "[bitmap-join-perf] meta file '" << meta_path << "' not found - skipping test."
 			          << std::endl;
@@ -139,7 +144,7 @@ TEST_CASE("Bitmap-Join (BHJ) vs Perfect-Hash vs DuckDB hash join (TPCH SF=5 parq
 	// Load bitmap-join metadata (PK/FK bindings) into the process-wide registry.
 	auto &registry = BitmapJoinMetaRegistry::GetInstance();
 	registry.Clear();
-	registry.LoadFromJson(string(kDataDir) + "/bitmap_join_meta.json");
+	registry.LoadFromJson(string(DataDir()) + "/bitmap_join_meta.json");
 
 	// For BHJ: the build side will be `part`; configure the planner override to point at the
 	// part-PK binding. (Module 6.6 BitmapJoinRule will eventually do this resolution from the
@@ -188,12 +193,12 @@ TEST_CASE("Bitmap-Join (BHJ) automatic PK/FK resolution without SetForceResolved
 	// Skip silently if the SF=5 parquet dataset is not present.
 	{
 		auto fs = FileSystem::CreateLocal();
-		if (!fs->DirectoryExists(kDataDir)) {
-			std::cerr << "[bitmap-join-perf] dataset directory '" << kDataDir
+		if (!fs->DirectoryExists(DataDir())) {
+			std::cerr << "[bitmap-join-perf] dataset directory '" << DataDir()
 			          << "' not found - skipping test." << std::endl;
 			return;
 		}
-		const string meta_path = string(kDataDir) + "/bitmap_join_meta.json";
+		const string meta_path = string(DataDir()) + "/bitmap_join_meta.json";
 		if (!fs->FileExists(meta_path)) {
 			std::cerr << "[bitmap-join-perf] meta file '" << meta_path << "' not found - skipping test."
 			          << std::endl;
@@ -209,7 +214,7 @@ TEST_CASE("Bitmap-Join (BHJ) automatic PK/FK resolution without SetForceResolved
 	// through automatic resolution.
 	auto &registry = BitmapJoinMetaRegistry::GetInstance();
 	registry.Clear();
-	registry.LoadFromJson(string(kDataDir) + "/bitmap_join_meta.json");
+	registry.LoadFromJson(string(DataDir()) + "/bitmap_join_meta.json");
 	registry.SetForceBitmapJoin(false);
 	registry.SetForceResolvedPK("", "");
 

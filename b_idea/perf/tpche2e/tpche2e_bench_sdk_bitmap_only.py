@@ -14,7 +14,7 @@ tpche2e_bench_sdk_bitmap_only.py — 只重测 project_bitmap, 两个 baseline �
   - tpche2e_speedup.png    project_bitmap 相比 official_baseline / project_baseline 的加速比
 
 用法:
-  cd /home/featurize/workspace/duckdb-cuda
+  cd <base_dir>        # gpu_paths.conf 里的 base_dir (python3 gpu_paths.py 可查看)
   bash b_idea/perf/tpche2e/build_harness.sh
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --runs 5
@@ -31,7 +31,12 @@ import sys
 # ============================================================
 # 路径配置
 # ============================================================
-BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
+# 仓库根目录: 由仓库根目录 gpu_paths.conf 的 base_dir 决定 (换机器只改那一行)
+_gp_root = os.path.dirname(os.path.abspath(__file__))
+while not os.path.isfile(os.path.join(_gp_root, "gpu_paths.py")) and os.path.dirname(_gp_root) != _gp_root:
+    _gp_root = os.path.dirname(_gp_root)
+sys.path.insert(0, _gp_root)
+from gpu_paths import BASE_DIR  # noqa: E402
 DATA_DIR = os.path.join(BASE_DIR, "data", "tpch_sf5_bitmap")
 META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
 PROJECT_LIB = os.path.join(BASE_DIR, "build", "release", "src", "libduckdb.so")

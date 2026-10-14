@@ -15,6 +15,7 @@
 // SF5-dataset-dependent tests; run explicitly with `./unittest "[bitmap_join_tpch_profile]"`.
 
 #include "catch.hpp"
+#include "gpu_paths.hpp"
 #include "test_helpers.hpp"
 #include "tpch_extension.hpp"
 
@@ -39,7 +40,11 @@ using namespace std;
 
 namespace {
 
-constexpr const char *kBitmapDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap";
+// 数据集根目录由 gpu_paths.conf 的 base_dir 决定 (换机器只改那一行)。
+const string &BitmapDataDir() {
+	static const string dir = gpu_paths::Join("data/tpch_sf5_bitmap");
+	return dir;
+}
 constexpr const char *kTables[] = {"region",  "nation",   "customer", "orders",
                                    "part",    "partsupp", "supplier", "lineitem"};
 
@@ -289,12 +294,12 @@ void RunAndReport(Connection &con, const string &name, const string &sql, std::o
 
 TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H queries (SF=5)",
           "[bitmap_join_tpch_profile][.]") {
-	if (!DatasetAvailable(kBitmapDataDir)) {
-		std::cerr << "[bitmap-join-tpch-profile] dataset directory '" << kBitmapDataDir
+	if (!DatasetAvailable(BitmapDataDir())) {
+		std::cerr << "[bitmap-join-tpch-profile] dataset directory '" << BitmapDataDir()
 		          << "' not found/incomplete - skipping test." << std::endl;
 		return;
 	}
-	const string meta_path = string(kBitmapDataDir) + "/bitmap_join_meta.json";
+	const string meta_path = string(BitmapDataDir()) + "/bitmap_join_meta.json";
 	{
 		auto fs = FileSystem::CreateLocal();
 		if (!fs->FileExists(meta_path)) {
@@ -306,7 +311,7 @@ TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H qu
 
 	DuckDB db(nullptr);
 	Connection con(db);
-	CreateViews(con, kBitmapDataDir);
+	CreateViews(con, BitmapDataDir());
 
 	auto &registry = BitmapJoinMetaRegistry::GetInstance();
 	registry.Clear();
@@ -315,7 +320,7 @@ TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H qu
 	registry.LoadFromJson(meta_path);
 
 	auto fs = FileSystem::CreateLocal();
-	const string csv_dir = "/home/featurize/workspace/duckdb-cuda/b_idea/perf/sf5";
+	const string csv_dir = gpu_paths::Join("b_idea/perf/sf5");
 	fs->CreateDirectoriesRecursive(csv_dir);
 	std::ofstream csv(csv_dir + "/tpch_operator_timing.csv", std::ios::out | std::ios::trunc);
 	csv << "query,join_label,baseline_ms,perfect_ms,bitmap_ms,bitmap_join_status,bitmap_payload_mode\n";

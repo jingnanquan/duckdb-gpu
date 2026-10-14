@@ -4,7 +4,7 @@
 # 按顺序执行 1.3 ~ 1.6 的所有子任务
 #
 # 用法:
-#   cd /home/featurize/workspace/duckdb-cuda
+#   cd <base_dir>     # gpu_paths.conf 里的 base_dir (bash gpu_paths.sh 可查看)
 #   bash a_idea/任务拆分/任务1/scripts/run_all.sh
 #
 # 或者分步执行:
@@ -16,7 +16,13 @@
 
 set -e
 
-BASE_DIR="/home/featurize/workspace/duckdb-cuda"
+# 仓库根目录: 由仓库根目录 gpu_paths.conf 的 base_dir 决定 (换机器只改那一行)
+_gp_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ ! -f "$_gp_root/gpu_paths.sh" ] && [ "$_gp_root" != "/" ]; do
+    _gp_root="$(dirname "$_gp_root")"
+done
+. "$_gp_root/gpu_paths.sh"     # 提供 $BASE_DIR
+
 TASK_DIR="${BASE_DIR}/a_idea/任务拆分/任务1"
 SCRIPTS_DIR="${TASK_DIR}/scripts"
 RESULTS_DIR="${TASK_DIR}/results"

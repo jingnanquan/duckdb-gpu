@@ -19,12 +19,13 @@
 // printed as diagnostics only (see design doc §5.3: "软性打印，不作为CI失败条件").
 //
 // The SF=5 parquet files (and bitmap_join_meta.json) live at:
-//   /home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap/
+//   <base_dir>/data/tpch_sf5_bitmap/     (base_dir = gpu_paths.conf, see test/include/gpu_paths.hpp)
 // If that directory (or its 8 tables) is not present, the test is skipped. Hidden behind the
 // `[.]` tag (like test_bitmap_join_perf.cpp) since it depends on that multi-GB external dataset
 // and is comparatively slow - run explicitly with `./unittest "[bitmap_join_tpch]"`.
 
 #include "catch.hpp"
+#include "gpu_paths.hpp"
 #include "test_helpers.hpp"
 #include "tpch_extension.hpp"
 
@@ -47,8 +48,15 @@ using namespace std;
 
 namespace {
 
-constexpr const char *kBitmapDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap";
-constexpr const char *kRawDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5";
+// 数据集根目录由 gpu_paths.conf 的 base_dir 决定 (换机器只改那一行)。
+const string &BitmapDataDir() {
+	static const string dir = gpu_paths::Join("data/tpch_sf5_bitmap");
+	return dir;
+}
+const string &RawDataDir() {
+	static const string dir = gpu_paths::Join("data/tpch_sf5");
+	return dir;
+}
 constexpr const char *kTables[] = {"region",  "nation",   "customer", "orders",
                                    "part",    "partsupp", "supplier", "lineitem"};
 
@@ -272,12 +280,12 @@ void WriteCsvRow(std::ofstream &csv, const string &query, const string &mode, id
 } // namespace
 
 TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H queries (SF=5 parquet)", "[bitmap_join_tpch][.]") {
-	if (!DatasetAvailable(kBitmapDataDir)) {
-		std::cerr << "[bitmap-join-tpch] dataset directory '" << kBitmapDataDir << "' not found/incomplete - "
+	if (!DatasetAvailable(BitmapDataDir())) {
+		std::cerr << "[bitmap-join-tpch] dataset directory '" << BitmapDataDir() << "' not found/incomplete - "
 		          << "skipping test." << std::endl;
 		return;
 	}
-	const string meta_path = string(kBitmapDataDir) + "/bitmap_join_meta.json";
+	const string meta_path = string(BitmapDataDir()) + "/bitmap_join_meta.json";
 	{
 		auto fs = FileSystem::CreateLocal();
 		if (!fs->FileExists(meta_path)) {
@@ -289,7 +297,7 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H queries (SF=5 parquet)", "[bitmap_
 
 	DuckDB db(nullptr);
 	Connection con(db);
-	CreateViews(con, kBitmapDataDir);
+	CreateViews(con, BitmapDataDir());
 
 	auto &registry = BitmapJoinMetaRegistry::GetInstance();
 	registry.Clear();
@@ -312,7 +320,7 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H queries (SF=5 parquet)", "[bitmap_
 	std::ofstream csv;
 	{
 		auto fs = FileSystem::CreateLocal();
-		const string csv_dir = "/home/featurize/workspace/duckdb-cuda/b_idea/perf/sf5";
+		const string csv_dir = gpu_paths::Join("b_idea/perf/sf5");
 		fs->CreateDirectoriesRecursive(csv_dir);
 		csv.open(csv_dir + "/tpch_q5_q9_q10.csv", std::ios::out | std::ios::trunc);
 		csv << "query,mode,hash_join_count,bhj_hits,rows_out,cold_ms,warm_avg_ms,warm_min_ms,warm_max_ms\n";
@@ -379,7 +387,7 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H queries (SF=5 parquet)", "[bitmap_
 // (design doc §5.3 point 5).
 TEST_CASE("Bitmap-Join (BHJ) TPC-H queries cross-validation against the raw (non-bitmap) SF=5 dataset",
           "[bitmap_join_tpch][.]") {
-	if (!DatasetAvailable(kBitmapDataDir) || !DatasetAvailable(kRawDataDir)) {
+	if (!DatasetAvailable(BitmapDataDir()) || !DatasetAvailable(RawDataDir())) {
 		std::cerr << "[bitmap-join-tpch] one of the two SF=5 dataset directories is missing/incomplete - "
 		          << "skipping cross-validation test." << std::endl;
 		return;
@@ -387,13 +395,13 @@ TEST_CASE("Bitmap-Join (BHJ) TPC-H queries cross-validation against the raw (non
 
 	DuckDB bitmap_db(nullptr);
 	Connection bitmap_con(bitmap_db);
-	CreateViews(bitmap_con, kBitmapDataDir);
+	CreateViews(bitmap_con, BitmapDataDir());
 	REQUIRE_NO_FAIL(*bitmap_con.Query("SET open_perfect_join=false"));
 	REQUIRE_NO_FAIL(*bitmap_con.Query("SET open_bitmap_join=false"));
 
 	DuckDB raw_db(nullptr);
 	Connection raw_con(raw_db);
-	CreateViews(raw_con, kRawDataDir);
+	CreateViews(raw_con, RawDataDir());
 
 	auto specs = GetQueries(GetQueryIds());
 	for (auto &spec : specs) {
