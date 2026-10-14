@@ -2,6 +2,12 @@
 # This file specifies intentionally untracked files that git should ignore.
 #==============================================================================#
 
+# Performance artifacts: ignore all csv/png files under b_idea/perf.
+b_idea/perf/*.csv
+b_idea/perf/*.png
+b_idea/perf/**/*.csv
+b_idea/perf/**/*.png
+
 #==============================================================================#
 # File extensions to be ignored anywhere in the tree.
 #==============================================================================#

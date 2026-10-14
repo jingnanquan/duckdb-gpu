@@ -81,6 +81,7 @@ make debug -j"$(nproc)"
 ## 2. 生成 TPC-H SF=5 数据集（原始版本）
 
 用刚编译好的 `duckdb` CLI（必须是已加载 `tpch` 扩展的这份二进制）跑数据生成 SQL：
+直接使用脚本吧：bash ./b_idea/gen_tpch_sf5.sh
 
 ```bash
 cd /home/featurize/workspace/duckdb-cuda

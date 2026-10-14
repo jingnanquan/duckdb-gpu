@@ -9,16 +9,30 @@ tpche2e_bench_sdk.py — 基于 DuckDB C SDK 的 TPC-H 22 查询端到端 (e2e) 
   (C) project_bitmap   : 本项目 build/release/src/libduckdb.so + bitmap_join_load + open_bitmap_join=true
 
 每条查询: DEFAULT_WARMUP 次预热 (只暖 OS/内部缓存, 不计入) + DEFAULT_RUNS 次取均值。
-产物:
-  - tpche2e_results.csv
-  - tpche2e_chart.png      三组耗时柱状图
-  - tpche2e_speedup.png    project_bitmap 相比 official_baseline / project_baseline 的加速比
+
+加载模式 (--load-mode, 用于与 "数据已驻留内存" 的执行引擎对齐口径):
+  view (默认): CREATE OR REPLACE VIEW ... AS SELECT * FROM read_parquet(...)
+      只是 parquet 的映射, 每条查询都要重新解码 parquet。
+  mem        : CREATE OR REPLACE TABLE ... AS SELECT * FROM read_parquet(...)
+      把 8 张表 CTAS 物化进 DuckDB 自身列存 (纯内存库), 之后查询不再触碰 parquet。
+两种模式下建表/物化的耗时都单独统计为 <group>_load_ms, 不计入查询时间。
+DB 生命周期 (--db-mode): auto (view->per-query, mem->reuse) / per-query / reuse。
+
+产物 (mem 模式下文件名带 _mem 后缀, 避免覆盖 view 模式结果):
+  - tpche2e_results[_mem].csv
+  - tpche2e_chart[_mem].png      三组耗时柱状图
+  - tpche2e_speedup[_mem].png    project_bitmap 相比 official_baseline / project_baseline 的加速比
 
 用法:
   cd <base_dir>        # gpu_paths.conf 里的 base_dir (python3 gpu_paths.py 可查看)
   bash b_idea/perf/tpche2e/build_harness.sh
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py
+  python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py --load-mode mem
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py --queries 1,6,9,18
+
+官方 libduckdb.so: 首次运行会下载到 bin/official/, 之后复用。
+GitHub Releases 直连在国内常被限速/卡死, 脚本会自动回退到镜像; 如需手动指定:
+  --official-url <url>   或   环境变量 DUCKDB_OFFICIAL_LIB_URL=<url>
 """
 
 import argparse
@@ -28,6 +42,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+import urllib.request
 import zipfile
 
 # ============================================================
@@ -56,17 +72,46 @@ OFFICIAL_URL = ("https://github.com/duckdb/duckdb/releases/download/"
 OFFICIAL_LIB_DIR = os.path.join(OUT_DIR, "bin", "official")
 OFFICIAL_LIB = os.path.join(OFFICIAL_LIB_DIR, "libduckdb.so")
 
+# GitHub Releases 直连常常被限速甚至卡死 (表现为进度停在几 MB 不动)。
+# 这里准备若干镜像前缀, 下载失败/卡住时按顺序自动回退。
+# 优先级: --official-url > 环境变量 DUCKDB_OFFICIAL_LIB_URL > 直连 > 镜像。
+GITHUB_MIRRORS = ["https://ghfast.top/", "https://gh-proxy.com/"]
+DOWNLOAD_TIMEOUT = 20       # 单次 urlopen 超时 (秒); 用于检测"卡住完全无数据"
+SLOW_GRACE_SECS = 20        # 连接建立后的宽限期, 期间不判慢
+MIN_SPEED_BPS = 200 * 1024  # 宽限期后平均速度低于它就放弃该源, 换下一个
+MIN_ZIP_BYTES = 5 * 1024 * 1024   # 小于它认为不是完整的 libduckdb zip
+
 # 计时参数
 DEFAULT_RUNS = 3
 DEFAULT_WARMUP = 1
 DEFAULT_TIMEOUT = 600  # 单条查询超时 (秒), harness 内部不设超时, 这里仅保护 subprocess
 
+LOAD_MODES = ("view", "mem")
+DB_MODES = ("auto", "per-query", "reuse")
+
+# 产物路径: view -> 原名, 其它 load_mode -> 带 _<mode> 后缀, 避免互相覆盖
 CSV_PATH = os.path.join(OUT_DIR, "tpche2e_results.csv")
 CHART_PATH = os.path.join(OUT_DIR, "tpche2e_chart.png")
 SPEEDUP_PATH = os.path.join(OUT_DIR, "tpche2e_speedup.png")
 
 TPCH_TABLES = ["region", "nation", "customer", "orders",
                "part", "partsupp", "supplier", "lineitem"]
+
+
+def set_output_paths(load_mode):
+    """按 load_mode 重设产物路径 (view 用原名, mem 用 _mem 后缀)。"""
+    global CSV_PATH, CHART_PATH, SPEEDUP_PATH
+    suffix = "" if load_mode == "view" else "_" + load_mode
+    CSV_PATH = os.path.join(OUT_DIR, f"tpche2e_results{suffix}.csv")
+    CHART_PATH = os.path.join(OUT_DIR, f"tpche2e_chart{suffix}.png")
+    SPEEDUP_PATH = os.path.join(OUT_DIR, f"tpche2e_speedup{suffix}.png")
+
+
+def resolve_db_mode(load_mode, db_mode):
+    """auto -> mem 用 reuse (物化只做一次), view 用 per-query。与 harness 一致。"""
+    if not db_mode or db_mode == "auto":
+        return "reuse" if load_mode == "mem" else "per-query"
+    return db_mode
 
 
 # ============================================================
@@ -129,23 +174,88 @@ def write_queries_file(queries, path):
 # ============================================================
 # 官方 libduckdb.so 获取
 # ============================================================
-def ensure_official_lib(force=False):
+def official_url_candidates():
+    """按优先级返回待尝试的下载 URL 列表 (去重保序)。"""
+    cands = []
+    env_url = os.environ.get("DUCKDB_OFFICIAL_LIB_URL", "").strip()
+    if env_url:
+        cands.append(env_url)
+    cands.append(OFFICIAL_URL)
+    cands += [m + OFFICIAL_URL for m in GITHUB_MIRRORS]
+    seen, out = set(), []
+    for u in cands:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def download_file(url, dst, timeout):
+    """分块下载并打印进度。
+
+    用 urlopen(timeout=...) 而不是 urlretrieve: 后者没有超时参数, 一旦
+    GitHub 直连被限速就会永久卡住 (实测停在 1MB 不动且不报错)。
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+    t0 = time.time()
+    last_report = 0.0
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dst, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            now = time.time()
+            elapsed = now - t0
+            # 速度守卫: 光靠 socket timeout 只能防"完全卡死", 防不住"龟速"
+            # (实测 GitHub 直连有时能通但只有 60KB/s, 40MB 要 11 分钟)。
+            if elapsed > SLOW_GRACE_SECS and done / elapsed < MIN_SPEED_BPS:
+                raise RuntimeError(
+                    f"速度过低 ({done / elapsed / 1024:.0f} KB/s < "
+                    f"{MIN_SPEED_BPS / 1024:.0f} KB/s), 放弃该源")
+            if now - last_report >= 5:
+                last_report = now
+                speed = done / max(elapsed, 1e-9) / 1e6
+                size = f"{done/1e6:.1f}/{total/1e6:.1f} MB" if total else f"{done/1e6:.1f} MB"
+                log(f"           {size}  ({speed:.2f} MB/s)")
+    return done
+
+
+def ensure_official_lib(force=False, url=None):
     if os.path.exists(OFFICIAL_LIB) and not force:
         log(f"[official] 已存在, 跳过下载: {OFFICIAL_LIB}")
         return OFFICIAL_LIB
     os.makedirs(OFFICIAL_LIB_DIR, exist_ok=True)
     zip_path = os.path.join(OFFICIAL_LIB_DIR, "libduckdb-linux-amd64.zip")
-    log(f"[official] 下载 {OFFICIAL_URL}")
-    try:
-        import urllib.request
-        def _hook(block_num, block_size, total):
-            if total > 0 and block_num % 40 == 0:
-                done = block_num * block_size
-                log(f"           {done/1e6:.1f}/{total/1e6:.1f} MB")
-        urllib.request.urlretrieve(OFFICIAL_URL, zip_path, _hook)
-    except Exception as e:  # noqa: BLE001
-        log(f"[ERROR] 下载官方 libduckdb 失败: {e}")
+
+    cands = official_url_candidates()
+    if url:
+        cands = [url] + [c for c in cands if c != url]
+
+    last_err = None
+    for i, u in enumerate(cands, 1):
+        log(f"[official] 下载源 {i}/{len(cands)}: {u}")
+        try:
+            download_file(u, zip_path, DOWNLOAD_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log(f"[official]   失败: {e} —— 换下一个源")
+            continue
+        if os.path.getsize(zip_path) < MIN_ZIP_BYTES:
+            last_err = f"只下载了 {os.path.getsize(zip_path)} 字节, 不是完整 zip"
+            log(f"[official]   {last_err} —— 换下一个源")
+            continue
+        log(f"[official]   下载完成: {os.path.getsize(zip_path)/1e6:.1f} MB")
+        break
+    else:
+        log(f"[official ERROR] 所有下载源均失败: {last_err}")
+        log(f"       可手动下载后放到: {OFFICIAL_LIB}")
+        log("       或用 --official-url <url> / 环境变量 DUCKDB_OFFICIAL_LIB_URL 指定可用源")
         sys.exit(1)
+
     log(f"[official] 解压 libduckdb.so -> {OFFICIAL_LIB_DIR}")
     with zipfile.ZipFile(zip_path) as z:
         # 资源里 libduckdb.so 通常在根, 也可能在 include/ 等; 只取 .so
@@ -164,7 +274,8 @@ def ensure_official_lib(force=False):
 # ============================================================
 # 运行 harness (单进程, 返回解析后的结果 dict)
 # ============================================================
-def run_harness(lib_dir, data_dir, meta, bitmap, set_bitmap_off, warmup, runs, queries_file):
+def run_harness(lib_dir, data_dir, meta, bitmap, set_bitmap_off, warmup, runs,
+                queries_file, load_mode="view", db_mode="auto", memory_limit=""):
     env = dict(os.environ)
     # 让 LD_LIBRARY_PATH 优先于二进制内建的 RUNPATH, 从而切换到指定 .so
     existing = env.get("LD_LIBRARY_PATH", "")
@@ -174,13 +285,18 @@ def run_harness(lib_dir, data_dir, meta, bitmap, set_bitmap_off, warmup, runs, q
            "--queries", queries_file,
            "--data-dir", data_dir,
            "--warmup", str(warmup),
-           "--runs", str(runs)]
+           "--runs", str(runs),
+           "--load-mode", load_mode,
+           "--db-mode", db_mode]
+    if memory_limit:
+        cmd += ["--memory-limit", memory_limit]
     if bitmap:
         cmd += ["--bitmap", "--meta", meta]
     elif set_bitmap_off:
         cmd += ["--set-bitmap-off"]
 
-    log(f"[harness] LD_LIBRARY_PATH={lib_dir}  bitmap={bitmap}  set_bitmap_off={set_bitmap_off}")
+    log(f"[harness] LD_LIBRARY_PATH={lib_dir}  bitmap={bitmap}  "
+        f"set_bitmap_off={set_bitmap_off}  load_mode={load_mode}  db_mode={db_mode}")
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               universal_newlines=True, timeout=DEFAULT_TIMEOUT,
@@ -196,17 +312,24 @@ def run_harness(lib_dir, data_dir, meta, bitmap, set_bitmap_off, warmup, runs, q
         for line in proc.stderr.strip().splitlines():
             log("  " + line)
     try:
-        return json.loads(proc.stdout)
+        parsed = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         log(f"[harness ERROR] 解析 JSON 失败: {e}\nRAW:\n{proc.stdout}")
         sys.exit(1)
+    # 统一成 {"queries": {...}, "load_total": x|None, "load_by_query": {...}}
+    load = parsed.get("load") or {}
+    return {
+        "queries": parsed.get("queries") or {},
+        "load_total": load.get("total_ms"),
+        "load_by_query": load.get("by_query") or {},
+    }
 
 
 # ============================================================
 # CSV / 画图
 # ============================================================
 def metric(res, qname):
-    item = res.get(qname)
+    item = (res or {}).get("queries", {}).get(qname)
     if not item:
         return "", "", "", ""
     warmup = item["warmup"] if item.get("warmup") is not None else ""
@@ -214,6 +337,20 @@ def metric(res, qname):
     mn = min(item["runs"]) if item.get("runs") else ""
     mx = max(item["runs"]) if item.get("runs") else ""
     return warmup, avg, mn, mx
+
+
+def load_of(res, qname):
+    """该组在该查询上的建表/物化耗时 (ms)。
+
+    per-query 模式下每条查询各自建表 -> 用 load_by_query[qname];
+    reuse 模式下只建一次 -> 用 load_total。
+    """
+    if not res:
+        return None
+    per_query = (res.get("load_by_query") or {}).get(qname)
+    if per_query is not None:
+        return per_query
+    return res.get("load_total")
 
 
 def is_number(value):
@@ -224,13 +361,18 @@ def fmt_seconds(value):
     return f"{value:.4f}" if is_number(value) else ""
 
 
+def fmt_ms(value):
+    return f"{value:.1f}" if is_number(value) else ""
+
+
 def fmt_speedup(base_avg, bitmap_avg):
     if is_number(base_avg) and is_number(bitmap_avg) and bitmap_avg > 0:
         return f"{base_avg / bitmap_avg:.3f}"
     return ""
 
 
-def write_csv(official_res, project_baseline_res, project_bitmap_res, queries):
+def write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
+              load_mode="view", db_mode="auto"):
     rows = []
     for qnum in sorted(queries.keys()):
         qname = f"Q{qnum:02d}"
@@ -239,14 +381,19 @@ def write_csv(official_res, project_baseline_res, project_bitmap_res, queries):
         pm_w, pm_avg, pm_min, pm_max = metric(project_bitmap_res, qname)
         rows.append({
             "query": qname,
+            "load_mode": load_mode,
+            "db_mode": db_mode,
+            "official_baseline_load_ms": fmt_ms(load_of(official_res, qname)),
             "official_baseline_warmup_s": fmt_seconds(ob_w),
             "official_baseline_avg_s": fmt_seconds(ob_avg),
             "official_baseline_min_s": fmt_seconds(ob_min),
             "official_baseline_max_s": fmt_seconds(ob_max),
+            "project_baseline_load_ms": fmt_ms(load_of(project_baseline_res, qname)),
             "project_baseline_warmup_s": fmt_seconds(pb_w),
             "project_baseline_avg_s": fmt_seconds(pb_avg),
             "project_baseline_min_s": fmt_seconds(pb_min),
             "project_baseline_max_s": fmt_seconds(pb_max),
+            "project_bitmap_load_ms": fmt_ms(load_of(project_bitmap_res, qname)),
             "project_bitmap_warmup_s": fmt_seconds(pm_w),
             "project_bitmap_avg_s": fmt_seconds(pm_avg),
             "project_bitmap_min_s": fmt_seconds(pm_min),
@@ -262,12 +409,70 @@ def write_csv(official_res, project_baseline_res, project_bitmap_res, queries):
     return rows
 
 
+def _import_plot_libs():
+    """把 plt / np 提升为模块级, 供下面的辅助函数使用。"""
+    global plt, np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+
+def _fmt_bar(value):
+    """柱顶数字: 按量级自适应, 尽量短以免柱子间互相压字。"""
+    if value >= 100:
+        return f"{value:.0f}"
+    if value >= 10:
+        return f"{value:.1f}"
+    if value >= 1:
+        return f"{value:.2f}"
+    return f"{value:.3f}"
+
+
+def _grouped_bars(ax, x, series, colors, labels, group_width, gap_ratio,
+                  log_scale, fontsize=6):
+    """把 n 组柱子均匀排在每个 x 的 group_width 内, 组间留 gap, 并在柱顶标数字。"""
+    n = len(series)
+    slot = group_width / n
+    width = slot * (1.0 - gap_ratio)
+    left = -group_width / 2.0 + slot / 2.0
+    peak = max(series_flat(series))   # 线性轴下标签留白用
+    all_bars = []
+    for j, (values, color, label) in enumerate(zip(series, colors, labels)):
+        xs = [xi + left + j * slot for xi in x]
+        bars = ax.bar(xs, [v if v is not None else np.nan for v in values],
+                      width=width, label=label, color=color)
+        for b, v in zip(bars, values):
+            if v is None or not np.isfinite(v) or v <= 0:
+                continue
+            # log 轴用乘法留白, 线性轴用加法
+            y = v * 1.08 if log_scale else v + peak * 0.012
+            ax.text(b.get_x() + b.get_width() / 2.0, y, _fmt_bar(v),
+                    ha="center", va="bottom", fontsize=fontsize, rotation=90)
+        all_bars.append(bars)
+    return all_bars
+
+
+def series_flat(series):
+    return [v for values in series for v in values
+            if v is not None and np.isfinite(v) and v > 0] or [1.0]
+
+
+def _headroom(ax, values, log_scale):
+    """给柱顶数字留出空间, 否则旋转 90 度的文字会被顶裁掉。"""
+    vs = [v for v in values if v is not None and np.isfinite(v) and v > 0]
+    if not vs:
+        return
+    lo, _ = ax.get_ylim()
+    if log_scale:
+        ax.set_ylim(bottom=lo, top=max(vs) * 2.6)
+    else:
+        ax.set_ylim(bottom=0, top=max(vs) * 1.25)
+
+
 def plot(results_rows):
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
+        _import_plot_libs()
     except ImportError:
         log("[plot] matplotlib 不可用, 跳过画图 (CSV 已正常生成)")
         return
@@ -290,19 +495,19 @@ def plot(results_rows):
         speedup_vs_project.append(pb / pm if (pb and pm and pm > 0) else 0.0)
 
     x = list(range(len(labels)))
-    w = 0.26
 
-    fig, ax = plt.subplots(figsize=(18, 7))
-    ax.bar([i - w for i in x],
-           [v if v is not None else np.nan for v in official_baseline],
-           width=w, label="official_baseline (DuckDB 1.5.1)", color="#4C72B0")
-    ax.bar(x,
-           [v if v is not None else np.nan for v in project_baseline],
-           width=w, label="project_baseline (open_bitmap_join=false)", color="#55A868")
-    ax.bar([i + w for i in x],
-           [v if v is not None else np.nan for v in project_bitmap],
-           width=w, label="project_bitmap (open_bitmap_join=true)", color="#DD8452")
+    # ---- 图 1: 三组耗时 (log 轴) ----
+    fig, ax = plt.subplots(figsize=(20, 7.5))
+    series = [official_baseline, project_baseline, project_bitmap]
+    _grouped_bars(
+        ax, x, series,
+        colors=["#4C72B0", "#55A868", "#DD8452"],
+        labels=["official_baseline (DuckDB 1.5.1)",
+                "project_baseline (open_bitmap_join=false)",
+                "project_bitmap (open_bitmap_join=true)"],
+        group_width=0.8, gap_ratio=0.16, log_scale=True)
     ax.set_yscale("log")
+    _headroom(ax, series_flat(series), log_scale=True)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Avg execution time (s, log scale)")
@@ -310,31 +515,29 @@ def plot(results_rows):
     ax.legend()
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(CHART_PATH, dpi=120)
+    fig.savefig(CHART_PATH, dpi=130)
     plt.close(fig)
     log(f"[plot] 已保存三柱状图 {CHART_PATH}")
 
-    fig, ax = plt.subplots(figsize=(18, 7))
-    sw = 0.38
-    bars1 = ax.bar([i - sw / 2 for i in x], speedup_vs_official,
-                   width=sw, label="official_baseline / project_bitmap", color="#4C72B0")
-    bars2 = ax.bar([i + sw / 2 for i in x], speedup_vs_project,
-                   width=sw, label="project_baseline / project_bitmap", color="#55A868")
+    # ---- 图 2: 两组加速比 (线性轴) ----
+    fig, ax = plt.subplots(figsize=(20, 7.5))
+    series = [speedup_vs_official, speedup_vs_project]
+    _grouped_bars(
+        ax, x, series,
+        colors=["#4C72B0", "#55A868"],
+        labels=["official_baseline / project_bitmap",
+                "project_baseline / project_bitmap"],
+        group_width=0.74, gap_ratio=0.14, log_scale=False, fontsize=7)
     ax.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    _headroom(ax, series_flat(series), log_scale=False)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Speedup (baseline avg / project_bitmap avg)")
     ax.set_title("project_bitmap speedup over official_baseline and project_baseline")
-    for bars in (bars1, bars2):
-        for b in bars:
-            s = b.get_height()
-            if s > 0:
-                ax.text(b.get_x() + b.get_width() / 2, s + 0.02, f"{s:.2f}",
-                        ha="center", va="bottom", fontsize=6, rotation=90)
     ax.legend()
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(SPEEDUP_PATH, dpi=120)
+    fig.savefig(SPEEDUP_PATH, dpi=130)
     plt.close(fig)
     log(f"[plot] 已保存两组加速比图 {SPEEDUP_PATH}")
 
@@ -351,11 +554,21 @@ def main():
     ap.add_argument("--official-lib", default=OFFICIAL_LIB,
                     help="官方 libduckdb.so 路径 (缺省自动下载)")
     ap.add_argument("--official-version", default=OFFICIAL_VERSION)
+    ap.add_argument("--official-url", default=None,
+                    help="指定官方 libduckdb zip 的完整 URL (优先于内置源与镜像); "
+                         "也可用环境变量 DUCKDB_OFFICIAL_LIB_URL")
     ap.add_argument("--harness", default=HARNESS)
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     ap.add_argument("--queries", default=None, help="只跑指定查询, 如 1,5,9")
+    ap.add_argument("--load-mode", default="view", choices=list(LOAD_MODES),
+                    help="view=parquet 映射(每次解码); mem=CTAS 物化进内存列存(只建表一次)")
+    ap.add_argument("--db-mode", default="auto", choices=list(DB_MODES),
+                    help="DB 生命周期: auto(view->per-query, mem->reuse); "
+                         "per-query=每条查询独立实例; reuse=全程一个实例")
+    ap.add_argument("--memory-limit", default="",
+                    help="可选, 如 24GB; 为空则沿用 DuckDB 默认")
     ap.add_argument("--official-only", action="store_true",
                     help="只跑 official_baseline")
     ap.add_argument("--project-baseline-only", action="store_true",
@@ -373,6 +586,11 @@ def main():
     DEFAULT_TIMEOUT = args.timeout
     DATA_DIR = args.data_dir
     META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
+    set_output_paths(args.load_mode)
+    db_mode = resolve_db_mode(args.load_mode, args.db_mode)
+
+    log(f"[config] load_mode={args.load_mode}  db_mode={args.db_mode} -> {db_mode}"
+        + (f"  memory_limit={args.memory_limit}" if args.memory_limit else ""))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     check_data_dir(DATA_DIR)
@@ -414,7 +632,8 @@ def main():
             log("[ERROR] 官方 lib 不存在且 --skip-download, 无法继续")
             sys.exit(1)
         else:
-            official_lib = ensure_official_lib(force=args.force_download)
+            official_lib = ensure_official_lib(force=args.force_download,
+                                               url=args.official_url)
 
     # 3) 跑批 (同一 harness, 切换 .so / --bitmap)
     official_res, project_baseline_res, project_bitmap_res = {}, {}, {}
@@ -425,7 +644,9 @@ def main():
         official_res = run_harness(
             lib_dir=os.path.dirname(official_lib),
             data_dir=DATA_DIR, meta=META_PATH, bitmap=False, set_bitmap_off=False,
-            warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN)
+            warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
+            load_mode=args.load_mode, db_mode=db_mode,
+            memory_limit=args.memory_limit)
     if run_project_baseline:
         log("\n" + "=" * 64)
         log("配置 B: project_baseline — 本项目 libduckdb.so + open_bitmap_join=false")
@@ -433,7 +654,9 @@ def main():
         project_baseline_res = run_harness(
             lib_dir=os.path.dirname(PROJECT_LIB),
             data_dir=DATA_DIR, meta=META_PATH, bitmap=False, set_bitmap_off=True,
-            warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN)
+            warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
+            load_mode=args.load_mode, db_mode=db_mode,
+            memory_limit=args.memory_limit)
     if run_project_bitmap:
         log("\n" + "=" * 64)
         log("配置 C: project_bitmap — 本项目 libduckdb.so + open_bitmap_join=true")
@@ -441,13 +664,16 @@ def main():
         project_bitmap_res = run_harness(
             lib_dir=os.path.dirname(PROJECT_LIB),
             data_dir=DATA_DIR, meta=META_PATH, bitmap=True, set_bitmap_off=False,
-            warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN)
+            warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
+            load_mode=args.load_mode, db_mode=db_mode,
+            memory_limit=args.memory_limit)
 
     # 4) 汇总 / CSV / 画图
     log("\n" + "=" * 64)
     log("汇总")
     log("=" * 64)
-    rows = write_csv(official_res, project_baseline_res, project_bitmap_res, queries)
+    rows = write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
+                     load_mode=args.load_mode, db_mode=db_mode)
     plot(rows)
 
     ob_rows = [r for r in rows if r["official_baseline_avg_s"]]
@@ -461,6 +687,20 @@ def main():
     pm_total_project = sum(float(r["project_bitmap_avg_s"]) for r in common_project)
     log(f"  已测量: official_baseline {len(ob_rows)} 条, project_baseline {len(pb_rows)} 条, "
         f"project_bitmap {len(pm_rows)} 条 (共 {len(rows)} 条)")
+    for name, res in (("official_baseline", official_res),
+                      ("project_baseline", project_baseline_res),
+                      ("project_bitmap", project_bitmap_res)):
+        if not res:
+            continue
+        per_query = res.get("load_by_query") or {}
+        total = res.get("load_total")
+        if per_query:
+            vals = [v for v in per_query.values() if v is not None]
+            if vals:
+                log(f"  {name} 建表耗时: 每条查询各自建表, "
+                    f"avg={sum(vals) / len(vals):.1f} ms, 合计={sum(vals):.1f} ms")
+        elif total is not None:
+            log(f"  {name} 建表耗时: 全程一次, {total:.1f} ms")
     if ob_total and pm_total_official:
         log(f"  project_bitmap 相比 official_baseline 整体加速比: {ob_total / pm_total_official:.3f}x")
     if pb_total and pm_total_project:

@@ -8,15 +8,19 @@ tpche2e_bench_sdk_bitmap_only.py — 只重测 project_bitmap, 两个 baseline �
   - official_baseline / project_baseline 的 warmup/avg/min/max 从 CSV 读取
   - 只运行本项目 project_bitmap: libduckdb.so + bitmap_join_load + open_bitmap_join=true
 
-产物:
-  - tpche2e_results.csv
-  - tpche2e_chart.png      三组耗时柱状图
-  - tpche2e_speedup.png    project_bitmap 相比 official_baseline / project_baseline 的加速比
+产物 (mem 模式下文件名带 _mem 后缀, 与 tpche2e_bench_sdk.py 保持一致):
+  - tpche2e_results[_mem].csv
+  - tpche2e_chart[_mem].png      三组耗时柱状图
+  - tpche2e_speedup[_mem].png    project_bitmap 相比 official_baseline / project_baseline 的加速比
+
+注意: --load-mode 必须与生成 baseline CSV 时使用的模式一致, 否则会把 view 模式的
+baseline 与 mem 模式的 bitmap 结果混在一起。
 
 用法:
   cd <base_dir>        # gpu_paths.conf 里的 base_dir (python3 gpu_paths.py 可查看)
   bash b_idea/perf/tpche2e/build_harness.sh
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py
+  python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --load-mode mem
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --runs 5
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --queries 1,6,9,18
 """
@@ -55,12 +59,32 @@ DEFAULT_RUNS = 3
 DEFAULT_WARMUP = 1
 DEFAULT_TIMEOUT = 600
 
+LOAD_MODES = ("view", "mem")
+DB_MODES = ("auto", "per-query", "reuse")
+
+# 产物路径: view -> 原名, 其它 load_mode -> 带 _<mode> 后缀, 避免互相覆盖
 CSV_PATH = os.path.join(OUT_DIR, "tpche2e_results.csv")
 CHART_PATH = os.path.join(OUT_DIR, "tpche2e_chart.png")
 SPEEDUP_PATH = os.path.join(OUT_DIR, "tpche2e_speedup.png")
 
 TPCH_TABLES = ["region", "nation", "customer", "orders",
                "part", "partsupp", "supplier", "lineitem"]
+
+
+def set_output_paths(load_mode):
+    """按 load_mode 重设产物路径 (view 用原名, mem 用 _mem 后缀)。"""
+    global CSV_PATH, CHART_PATH, SPEEDUP_PATH
+    suffix = "" if load_mode == "view" else "_" + load_mode
+    CSV_PATH = os.path.join(OUT_DIR, f"tpche2e_results{suffix}.csv")
+    CHART_PATH = os.path.join(OUT_DIR, f"tpche2e_chart{suffix}.png")
+    SPEEDUP_PATH = os.path.join(OUT_DIR, f"tpche2e_speedup{suffix}.png")
+
+
+def resolve_db_mode(load_mode, db_mode):
+    """auto -> mem 用 reuse (物化只做一次), view 用 per-query。与 harness 一致。"""
+    if not db_mode or db_mode == "auto":
+        return "reuse" if load_mode == "mem" else "per-query"
+    return db_mode
 
 
 # ============================================================
@@ -134,33 +158,47 @@ def csv_metric(row, prefix, legacy_prefix=None):
     avg = value(row, *(f"{name}_avg_s" for name in names))
     mn = value(row, *(f"{name}_min_s" for name in names))
     mx = value(row, *(f"{name}_max_s" for name in names))
+    load = value(row, *(f"{name}_load_ms" for name in names))
     runs = [v for v in (mn, mx) if v is not None]
-    return {"warmup": warmup, "avg": avg, "runs": runs, "error": None}
+    return {"warmup": warmup, "avg": avg, "runs": runs, "load": load, "error": None}
 
 
 def load_baselines_from_csv(csv_path):
-    """读取全量结果 CSV, 返回 official_baseline_res / project_baseline_res。"""
+    """读取全量结果 CSV, 返回 official_baseline_res / project_baseline_res。
+
+    返回结构与 harness 结果一致: {"queries": {...}, "load_total": None,
+    "load_by_query": {qname: load_ms}} —— CSV 里每行自带 load_ms, 因此都放进
+    load_by_query。
+    """
     if not os.path.exists(csv_path):
         log(f"[ERROR] baseline CSV 不存在: {csv_path}")
         log("       请先运行 tpche2e_bench_sdk.py 生成 official_baseline / project_baseline。")
         sys.exit(1)
-    official_res = {}
-    project_baseline_res = {}
+    official_res = {"queries": {}, "load_total": None, "load_by_query": {}}
+    project_baseline_res = {"queries": {}, "load_total": None, "load_by_query": {}}
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             qname = row["query"]
-            official_res[qname] = csv_metric(row, "official_baseline", legacy_prefix="official")
-            project_baseline_res[qname] = csv_metric(row, "project_baseline")
-    log(f"[baseline] 从 {csv_path} 加载了 {len(official_res)} 条 official_baseline 固定数据")
-    log(f"[baseline] 从 {csv_path} 加载了 {len(project_baseline_res)} 条 project_baseline 固定数据")
+            for res, prefix, legacy in ((official_res, "official_baseline", "official"),
+                                        (project_baseline_res, "project_baseline", None)):
+                item = csv_metric(row, prefix, legacy_prefix=legacy)
+                load = item.pop("load")
+                res["queries"][qname] = item
+                if load is not None:
+                    res["load_by_query"][qname] = load
+    log(f"[baseline] 从 {csv_path} 加载了 {len(official_res['queries'])} 条 "
+        f"official_baseline 固定数据")
+    log(f"[baseline] 从 {csv_path} 加载了 {len(project_baseline_res['queries'])} 条 "
+        f"project_baseline 固定数据")
     return official_res, project_baseline_res
 
 
 # ============================================================
 # 运行 harness (bitmap)
 # ============================================================
-def run_harness(lib_dir, data_dir, meta, bitmap, warmup, runs, queries_file):
+def run_harness(lib_dir, data_dir, meta, bitmap, warmup, runs, queries_file,
+                load_mode="view", db_mode="auto", memory_limit=""):
     env = dict(os.environ)
     existing = env.get("LD_LIBRARY_PATH", "")
     env["LD_LIBRARY_PATH"] = lib_dir + (":" + existing if existing else "")
@@ -169,11 +207,16 @@ def run_harness(lib_dir, data_dir, meta, bitmap, warmup, runs, queries_file):
            "--queries", queries_file,
            "--data-dir", data_dir,
            "--warmup", str(warmup),
-           "--runs", str(runs)]
+           "--runs", str(runs),
+           "--load-mode", load_mode,
+           "--db-mode", db_mode]
+    if memory_limit:
+        cmd += ["--memory-limit", memory_limit]
     if bitmap:
         cmd += ["--bitmap", "--meta", meta]
 
-    log(f"[harness] LD_LIBRARY_PATH={lib_dir}  bitmap={bitmap}")
+    log(f"[harness] LD_LIBRARY_PATH={lib_dir}  bitmap={bitmap}  "
+        f"load_mode={load_mode}  db_mode={db_mode}")
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               universal_newlines=True, timeout=DEFAULT_TIMEOUT,
@@ -188,17 +231,24 @@ def run_harness(lib_dir, data_dir, meta, bitmap, warmup, runs, queries_file):
         for line in proc.stderr.strip().splitlines():
             log("  " + line)
     try:
-        return json.loads(proc.stdout)
+        parsed = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         log(f"[harness ERROR] 解析 JSON 失败: {e}\nRAW:\n{proc.stdout}")
         sys.exit(1)
+    # 统一成 {"queries": {...}, "load_total": x|None, "load_by_query": {...}}
+    load = parsed.get("load") or {}
+    return {
+        "queries": parsed.get("queries") or {},
+        "load_total": load.get("total_ms"),
+        "load_by_query": load.get("by_query") or {},
+    }
 
 
 # ============================================================
 # CSV / 画图
 # ============================================================
 def metric(res, qname):
-    item = res.get(qname)
+    item = (res or {}).get("queries", {}).get(qname)
     if not item:
         return "", "", "", ""
     warmup = item["warmup"] if item.get("warmup") is not None else ""
@@ -206,6 +256,16 @@ def metric(res, qname):
     mn = min(item["runs"]) if item.get("runs") else ""
     mx = max(item["runs"]) if item.get("runs") else ""
     return warmup, avg, mn, mx
+
+
+def load_of(res, qname):
+    """该组在该查询上的建表/物化耗时 (ms)。"""
+    if not res:
+        return None
+    per_query = (res.get("load_by_query") or {}).get(qname)
+    if per_query is not None:
+        return per_query
+    return res.get("load_total")
 
 
 def is_number(value):
@@ -216,13 +276,18 @@ def fmt_seconds(value):
     return f"{value:.4f}" if is_number(value) else ""
 
 
+def fmt_ms(value):
+    return f"{value:.1f}" if is_number(value) else ""
+
+
 def fmt_speedup(base_avg, bitmap_avg):
     if is_number(base_avg) and is_number(bitmap_avg) and bitmap_avg > 0:
         return f"{base_avg / bitmap_avg:.3f}"
     return ""
 
 
-def write_csv(official_res, project_baseline_res, project_bitmap_res, queries):
+def write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
+              load_mode="view", db_mode="auto"):
     rows = []
     for qnum in sorted(queries.keys()):
         qname = f"Q{qnum:02d}"
@@ -231,14 +296,19 @@ def write_csv(official_res, project_baseline_res, project_bitmap_res, queries):
         pm_w, pm_avg, pm_min, pm_max = metric(project_bitmap_res, qname)
         rows.append({
             "query": qname,
+            "load_mode": load_mode,
+            "db_mode": db_mode,
+            "official_baseline_load_ms": fmt_ms(load_of(official_res, qname)),
             "official_baseline_warmup_s": fmt_seconds(ob_w),
             "official_baseline_avg_s": fmt_seconds(ob_avg),
             "official_baseline_min_s": fmt_seconds(ob_min),
             "official_baseline_max_s": fmt_seconds(ob_max),
+            "project_baseline_load_ms": fmt_ms(load_of(project_baseline_res, qname)),
             "project_baseline_warmup_s": fmt_seconds(pb_w),
             "project_baseline_avg_s": fmt_seconds(pb_avg),
             "project_baseline_min_s": fmt_seconds(pb_min),
             "project_baseline_max_s": fmt_seconds(pb_max),
+            "project_bitmap_load_ms": fmt_ms(load_of(project_bitmap_res, qname)),
             "project_bitmap_warmup_s": fmt_seconds(pm_w),
             "project_bitmap_avg_s": fmt_seconds(pm_avg),
             "project_bitmap_min_s": fmt_seconds(pm_min),
@@ -254,12 +324,70 @@ def write_csv(official_res, project_baseline_res, project_bitmap_res, queries):
     return rows
 
 
+def _import_plot_libs():
+    """把 plt / np 提升为模块级, 供下面的辅助函数使用。"""
+    global plt, np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+
+def _fmt_bar(value):
+    """柱顶数字: 按量级自适应, 尽量短以免柱子间互相压字。"""
+    if value >= 100:
+        return f"{value:.0f}"
+    if value >= 10:
+        return f"{value:.1f}"
+    if value >= 1:
+        return f"{value:.2f}"
+    return f"{value:.3f}"
+
+
+def _grouped_bars(ax, x, series, colors, labels, group_width, gap_ratio,
+                  log_scale, fontsize=5):
+    """把 n 组柱子均匀排在每个 x 的 group_width 内, 组间留 gap, 并在柱顶标数字。"""
+    n = len(series)
+    slot = group_width / n
+    width = slot * (1.0 - gap_ratio)
+    left = -group_width / 2.0 + slot / 2.0
+    peak = max(series_flat(series))   # 线性轴下标签留白用
+    all_bars = []
+    for j, (values, color, label) in enumerate(zip(series, colors, labels)):
+        xs = [xi + left + j * slot for xi in x]
+        bars = ax.bar(xs, [v if v is not None else np.nan for v in values],
+                      width=width, label=label, color=color)
+        for b, v in zip(bars, values):
+            if v is None or not np.isfinite(v) or v <= 0:
+                continue
+            # log 轴用乘法留白, 线性轴用加法
+            y = v * 1.08 if log_scale else v + peak * 0.012
+            ax.text(b.get_x() + b.get_width() / 2.0, y, _fmt_bar(v),
+                    ha="center", va="bottom", fontsize=fontsize, rotation=90)
+        all_bars.append(bars)
+    return all_bars
+
+
+def series_flat(series):
+    return [v for values in series for v in values
+            if v is not None and np.isfinite(v) and v > 0] or [1.0]
+
+
+def _headroom(ax, values, log_scale):
+    """给柱顶数字留出空间, 否则旋转 90 度的文字会被顶裁掉。"""
+    vs = [v for v in values if v is not None and np.isfinite(v) and v > 0]
+    if not vs:
+        return
+    lo, _ = ax.get_ylim()
+    if log_scale:
+        ax.set_ylim(bottom=lo, top=max(vs) * 2.6)
+    else:
+        ax.set_ylim(bottom=0, top=max(vs) * 1.25)
+
+
 def plot(results_rows):
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
+        _import_plot_libs()
     except ImportError:
         log("[plot] matplotlib 不可用, 跳过画图 (CSV 已正常生成)")
         return
@@ -282,19 +410,19 @@ def plot(results_rows):
         speedup_vs_project.append(pb / pm if (pb and pm and pm > 0) else 0.0)
 
     x = list(range(len(labels)))
-    w = 0.26
 
-    fig, ax = plt.subplots(figsize=(18, 7))
-    ax.bar([i - w for i in x],
-           [v if v is not None else np.nan for v in official_baseline],
-           width=w, label="official_baseline (fixed CSV)", color="#4C72B0")
-    ax.bar(x,
-           [v if v is not None else np.nan for v in project_baseline],
-           width=w, label="project_baseline (fixed CSV)", color="#55A868")
-    ax.bar([i + w for i in x],
-           [v if v is not None else np.nan for v in project_bitmap],
-           width=w, label="project_bitmap (re-measured)", color="#DD8452")
+    # ---- 图 1: 三组耗时 (log 轴) ----
+    fig, ax = plt.subplots(figsize=(20, 7.5))
+    series = [official_baseline, project_baseline, project_bitmap]
+    _grouped_bars(
+        ax, x, series,
+        colors=["#4C72B0", "#55A868", "#DD8452"],
+        labels=["official_baseline (fixed CSV)",
+                "project_baseline (fixed CSV)",
+                "project_bitmap (re-measured)"],
+        group_width=0.8, gap_ratio=0.16, log_scale=True)
     ax.set_yscale("log")
+    _headroom(ax, series_flat(series), log_scale=True)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Avg execution time (s, log scale)")
@@ -302,31 +430,29 @@ def plot(results_rows):
     ax.legend()
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(CHART_PATH, dpi=120)
+    fig.savefig(CHART_PATH, dpi=130)
     plt.close(fig)
     log(f"[plot] 已保存三柱状图 {CHART_PATH}")
 
-    fig, ax = plt.subplots(figsize=(18, 7))
-    sw = 0.38
-    bars1 = ax.bar([i - sw / 2 for i in x], speedup_vs_official,
-                   width=sw, label="official_baseline / project_bitmap", color="#4C72B0")
-    bars2 = ax.bar([i + sw / 2 for i in x], speedup_vs_project,
-                   width=sw, label="project_baseline / project_bitmap", color="#55A868")
+    # ---- 图 2: 两组加速比 (线性轴) ----
+    fig, ax = plt.subplots(figsize=(20, 7.5))
+    series = [speedup_vs_official, speedup_vs_project]
+    _grouped_bars(
+        ax, x, series,
+        colors=["#4C72B0", "#55A868"],
+        labels=["official_baseline / project_bitmap",
+                "project_baseline / project_bitmap"],
+        group_width=0.74, gap_ratio=0.14, log_scale=False, fontsize=6)
     ax.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    _headroom(ax, series_flat(series), log_scale=False)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Speedup (baseline avg / project_bitmap avg)")
     ax.set_title("project_bitmap speedup over official_baseline and project_baseline")
-    for bars in (bars1, bars2):
-        for b in bars:
-            s = b.get_height()
-            if s > 0:
-                ax.text(b.get_x() + b.get_width() / 2, s + 0.02, f"{s:.2f}",
-                        ha="center", va="bottom", fontsize=6, rotation=90)
     ax.legend()
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(SPEEDUP_PATH, dpi=120)
+    fig.savefig(SPEEDUP_PATH, dpi=130)
     plt.close(fig)
     log(f"[plot] 已保存两组加速比图 {SPEEDUP_PATH}")
 
@@ -341,12 +467,20 @@ def main():
     ap.add_argument("--data-dir", default=DATA_DIR)
     ap.add_argument("--project-cli", default=PROJECT_CLI)
     ap.add_argument("--harness", default=HARNESS)
-    ap.add_argument("--baselines-csv", default=BASELINES_CSV,
-                    help="固定 official_baseline/project_baseline 数据的 CSV 文件路径")
+    ap.add_argument("--baselines-csv", default=None,
+                    help="固定 official_baseline/project_baseline 数据的 CSV 文件路径 "
+                         "(缺省按 --load-mode 自动选择 tpche2e_results[_mem].csv)")
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     ap.add_argument("--queries", default=None, help="只跑指定查询, 如 1,5,9")
+    ap.add_argument("--load-mode", default="view", choices=list(LOAD_MODES),
+                    help="view=parquet 映射(每次解码); mem=CTAS 物化进内存列存(只建表一次)")
+    ap.add_argument("--db-mode", default="auto", choices=list(DB_MODES),
+                    help="DB 生命周期: auto(view->per-query, mem->reuse); "
+                         "per-query=每条查询独立实例; reuse=全程一个实例")
+    ap.add_argument("--memory-limit", default="",
+                    help="可选, 如 24GB; 为空则沿用 DuckDB 默认")
     ap.add_argument("--refresh-queries", action="store_true")
     args = ap.parse_args()
 
@@ -355,6 +489,12 @@ def main():
     DEFAULT_TIMEOUT = args.timeout
     DATA_DIR = args.data_dir
     META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
+    set_output_paths(args.load_mode)
+    baselines_csv = args.baselines_csv or CSV_PATH
+    db_mode = resolve_db_mode(args.load_mode, args.db_mode)
+
+    log(f"[config] load_mode={args.load_mode}  db_mode={args.db_mode} -> {db_mode}"
+        + (f"  memory_limit={args.memory_limit}" if args.memory_limit else ""))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     check_data_dir(DATA_DIR)
@@ -379,7 +519,7 @@ def main():
     write_queries_file(queries, QUERIES_RUN)
 
     # 2) 从 CSV 加载固定 baseline 数据
-    official_res, project_baseline_res = load_baselines_from_csv(args.baselines_csv)
+    official_res, project_baseline_res = load_baselines_from_csv(baselines_csv)
 
     # 3) 跑 project_bitmap 测试 (SDK harness)
     log("\n" + "=" * 64)
@@ -388,13 +528,16 @@ def main():
     project_bitmap_res = run_harness(
         lib_dir=os.path.dirname(PROJECT_LIB),
         data_dir=DATA_DIR, meta=META_PATH, bitmap=True,
-        warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN)
+        warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
+        load_mode=args.load_mode, db_mode=db_mode,
+        memory_limit=args.memory_limit)
 
     # 4) 汇总 / CSV / 画图
     log("\n" + "=" * 64)
     log("汇总")
     log("=" * 64)
-    rows = write_csv(official_res, project_baseline_res, project_bitmap_res, queries)
+    rows = write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
+                     load_mode=args.load_mode, db_mode=db_mode)
     plot(rows)
 
     ob_rows = [r for r in rows if r["official_baseline_avg_s"]]
