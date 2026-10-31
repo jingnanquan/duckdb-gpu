@@ -10,6 +10,12 @@ tpche2e_bench_sdk.py — 基于 DuckDB C SDK 的 TPC-H 22 查询端到端 (e2e) 
 
 每条查询: DEFAULT_WARMUP 次预热 (只暖 OS/内部缓存, 不计入) + DEFAULT_RUNS 次取均值。
 
+线程数 (--threads, 默认 16):
+  不设置时 DuckDB 的 threads 会取整机核数 (本机 96)。对 0.1s 量级的查询, 线程池
+  启停/任务窃取的耗时已与查询本身同阶; 在共享机器上叠加抢占后, 同一条查询重复
+  测量的变异系数会从 ~2% (16 线程) 恶化到 12%~18% (96 线程), 且均值反而更慢。
+  这会让 "整体加速比" 在 0.9x~1.4x 之间乱跳。因此这里显式固定为 16。
+
 加载模式 (--load-mode, 用于与 "数据已驻留内存" 的执行引擎对齐口径):
   view (默认): CREATE OR REPLACE VIEW ... AS SELECT * FROM read_parquet(...)
       只是 parquet 的映射, 每条查询都要重新解码 parquet。
@@ -29,6 +35,7 @@ DB 生命周期 (--db-mode): auto (view->per-query, mem->reuse) / per-query / re
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py --load-mode mem
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py --queries 1,6,9,18
+  python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py --threads 16
 
 官方 libduckdb.so: 首次运行会下载到 bin/official/, 之后复用。
 GitHub Releases 直连在国内常被限速/卡死, 脚本会自动回退到镜像; 如需手动指定:
@@ -84,6 +91,7 @@ MIN_ZIP_BYTES = 5 * 1024 * 1024   # 小于它认为不是完整的 libduckdb zip
 # 计时参数
 DEFAULT_RUNS = 3
 DEFAULT_WARMUP = 1
+DEFAULT_THREADS = 16  # 固定执行线程数; 不用默认的整机核数, 否则测量抖动极大
 DEFAULT_TIMEOUT = 600  # 单条查询超时 (秒), harness 内部不设超时, 这里仅保护 subprocess
 
 LOAD_MODES = ("view", "mem")
@@ -275,7 +283,8 @@ def ensure_official_lib(force=False, url=None):
 # 运行 harness (单进程, 返回解析后的结果 dict)
 # ============================================================
 def run_harness(lib_dir, data_dir, meta, bitmap, set_bitmap_off, warmup, runs,
-                queries_file, load_mode="view", db_mode="auto", memory_limit=""):
+                queries_file, load_mode="view", db_mode="auto", memory_limit="",
+                threads=DEFAULT_THREADS):
     env = dict(os.environ)
     # 让 LD_LIBRARY_PATH 优先于二进制内建的 RUNPATH, 从而切换到指定 .so
     existing = env.get("LD_LIBRARY_PATH", "")
@@ -286,6 +295,7 @@ def run_harness(lib_dir, data_dir, meta, bitmap, set_bitmap_off, warmup, runs,
            "--data-dir", data_dir,
            "--warmup", str(warmup),
            "--runs", str(runs),
+           "--threads", str(threads),
            "--load-mode", load_mode,
            "--db-mode", db_mode]
     if memory_limit:
@@ -296,7 +306,8 @@ def run_harness(lib_dir, data_dir, meta, bitmap, set_bitmap_off, warmup, runs,
         cmd += ["--set-bitmap-off"]
 
     log(f"[harness] LD_LIBRARY_PATH={lib_dir}  bitmap={bitmap}  "
-        f"set_bitmap_off={set_bitmap_off}  load_mode={load_mode}  db_mode={db_mode}")
+        f"set_bitmap_off={set_bitmap_off}  load_mode={load_mode}  db_mode={db_mode}  "
+        f"threads={threads}")
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               universal_newlines=True, timeout=DEFAULT_TIMEOUT,
@@ -372,7 +383,7 @@ def fmt_speedup(base_avg, bitmap_avg):
 
 
 def write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
-              load_mode="view", db_mode="auto"):
+              load_mode="view", db_mode="auto", threads=DEFAULT_THREADS):
     rows = []
     for qnum in sorted(queries.keys()):
         qname = f"Q{qnum:02d}"
@@ -383,6 +394,7 @@ def write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
             "query": qname,
             "load_mode": load_mode,
             "db_mode": db_mode,
+            "threads": threads,
             "official_baseline_load_ms": fmt_ms(load_of(official_res, qname)),
             "official_baseline_warmup_s": fmt_seconds(ob_w),
             "official_baseline_avg_s": fmt_seconds(ob_avg),
@@ -546,7 +558,8 @@ def plot(results_rows):
 # 主流程
 # ============================================================
 def main():
-    global DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_TIMEOUT, DATA_DIR, META_PATH
+    global DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_TIMEOUT, DEFAULT_THREADS
+    global DATA_DIR, META_PATH
     ap = argparse.ArgumentParser(
         description="TPC-H 22 e2e 对比: official_baseline / project_baseline / project_bitmap")
     ap.add_argument("--data-dir", default=DATA_DIR)
@@ -560,6 +573,10 @@ def main():
     ap.add_argument("--harness", default=HARNESS)
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
+    ap.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                    help=f"DuckDB 执行线程数 (默认 {DEFAULT_THREADS}); "
+                         "不显式限制时 DuckDB 会占满整机核数, 在共享机器上会造成 "
+                         "10%~20% 的测量抖动")
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     ap.add_argument("--queries", default=None, help="只跑指定查询, 如 1,5,9")
     ap.add_argument("--load-mode", default="view", choices=list(LOAD_MODES),
@@ -584,12 +601,14 @@ def main():
     DEFAULT_RUNS = args.runs
     DEFAULT_WARMUP = args.warmup
     DEFAULT_TIMEOUT = args.timeout
+    DEFAULT_THREADS = args.threads
     DATA_DIR = args.data_dir
     META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
     set_output_paths(args.load_mode)
     db_mode = resolve_db_mode(args.load_mode, args.db_mode)
 
     log(f"[config] load_mode={args.load_mode}  db_mode={args.db_mode} -> {db_mode}"
+        f"  threads={args.threads}  warmup={args.warmup}  runs={args.runs}"
         + (f"  memory_limit={args.memory_limit}" if args.memory_limit else ""))
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -646,7 +665,7 @@ def main():
             data_dir=DATA_DIR, meta=META_PATH, bitmap=False, set_bitmap_off=False,
             warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
             load_mode=args.load_mode, db_mode=db_mode,
-            memory_limit=args.memory_limit)
+            memory_limit=args.memory_limit, threads=DEFAULT_THREADS)
     if run_project_baseline:
         log("\n" + "=" * 64)
         log("配置 B: project_baseline — 本项目 libduckdb.so + open_bitmap_join=false")
@@ -656,7 +675,7 @@ def main():
             data_dir=DATA_DIR, meta=META_PATH, bitmap=False, set_bitmap_off=True,
             warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
             load_mode=args.load_mode, db_mode=db_mode,
-            memory_limit=args.memory_limit)
+            memory_limit=args.memory_limit, threads=DEFAULT_THREADS)
     if run_project_bitmap:
         log("\n" + "=" * 64)
         log("配置 C: project_bitmap — 本项目 libduckdb.so + open_bitmap_join=true")
@@ -666,14 +685,14 @@ def main():
             data_dir=DATA_DIR, meta=META_PATH, bitmap=True, set_bitmap_off=False,
             warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
             load_mode=args.load_mode, db_mode=db_mode,
-            memory_limit=args.memory_limit)
+            memory_limit=args.memory_limit, threads=DEFAULT_THREADS)
 
     # 4) 汇总 / CSV / 画图
     log("\n" + "=" * 64)
     log("汇总")
     log("=" * 64)
     rows = write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
-                     load_mode=args.load_mode, db_mode=db_mode)
+                     load_mode=args.load_mode, db_mode=db_mode, threads=DEFAULT_THREADS)
     plot(rows)
 
     ob_rows = [r for r in rows if r["official_baseline_avg_s"]]

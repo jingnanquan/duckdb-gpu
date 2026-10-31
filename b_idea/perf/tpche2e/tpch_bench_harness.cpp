@@ -11,6 +11,7 @@
 //      默认 auto: --load-mode view -> per-query, --load-mode mem -> reuse。
 //   2) 计时精度: 用 std::chrono::steady_clock 紧贴 duckdb_query() (C API 已
 //      完整物化结果), 排除 CLI 初始化/打印/进程退出等噪声。
+//   3) 线程数: 见下面 --threads 的说明 —— 显式固定, 不再用默认的整机核数。
 //
 // 加载模式 (新增, 用于与 "数据已驻留内存" 的执行引擎对齐口径):
 //   --load-mode view (默认): CREATE OR REPLACE VIEW t AS SELECT * FROM read_parquet(...)
@@ -27,13 +28,19 @@
 // 是否下发 bitmap_join_load / open_bitmap_join。这样三遍在同一机器、同一
 // 进程模型下测量, 偏差可控。
 //
+// 线程数 (--threads, 默认 16):
+//   不显式设置时 DuckDB 会把 threads 取成整机核数 (本机 96)。对 0.1s 量级的查询,
+//   线程池启动/回收与任务窃取的耗时已和查询本身同阶, 加上共享机器上的抢占,
+//   同一条查询重复 20 次的变异系数会从 ~2% (16 线程) 恶化到 ~12%~18% (96 线程),
+//   并且均值反而更慢。因此固定一个较小的线程数, 保证测量可复现。
+//
 // 用法:
 //   LD_LIBRARY_PATH=<dir-with-libduckdb.so> ./tpch_bench_harness \
 //       --queries queries_run.sql --data-dir <parquet dir> \
 //       [--meta bitmap_join_meta.json] [--bitmap] [--set-bitmap-off] \
 //       [--load-mode view|mem] [--db-mode auto|per-query|reuse] \
 //       [--memory-limit 24GB] \
-//       [--warmup 1] [--runs 3]
+//       [--threads 16] [--warmup 1] [--runs 3]
 //
 // 查询文件格式 (由 Python 驱动拼接): 以单独一行 "--QUERY Qnn" 作为分隔符,
 // 其后的内容 (直到下一个 "--QUERY" 或文件尾) 即为该查询的 SQL 文本。
@@ -71,6 +78,7 @@ struct Config {
     std::string load_mode = "view";   // view | mem
     std::string db_mode = "auto";     // auto | per-query | reuse
     std::string memory_limit;         // 可选, 如 "24GB"; 为空则沿用 DuckDB 默认
+    int threads = 16;                 // 执行线程数, 固定 16 以保证测量可复现
     int warmup = 1;
     int runs = 3;
 };
@@ -159,6 +167,9 @@ struct DB {
         // 关闭扩展自动安装/加载 (与原脚本一致)
         exec("SET autoinstall_known_extensions=false;");
         exec("SET autoload_known_extensions=false;");
+        // 固定线程数: 默认会把整机核数 (96) 全占上, 对 0.1s 级查询会带来巨大抖动
+        exec(("SET threads=" + std::to_string(cfg.threads) + ";").c_str());
+        fprintf(stderr, "[harness] threads=%d\n", cfg.threads);
         if (!cfg.memory_limit.empty())
             exec(("SET memory_limit='" + cfg.memory_limit + "';").c_str());
 
@@ -284,7 +295,7 @@ void usage() {
             "usage: tpch_bench_harness --queries f.sql --data-dir D "
             "[--meta m.json] [--bitmap] [--set-bitmap-off] "
             "[--load-mode view|mem] [--db-mode auto|per-query|reuse] "
-            "[--memory-limit 24GB] [--warmup N] [--runs N]\n");
+            "[--memory-limit 24GB] [--threads N] [--warmup N] [--runs N]\n");
 }
 
 }  // namespace
@@ -305,6 +316,7 @@ int main(int argc, char **argv) {
         else if (a == "--load-mode") cfg.load_mode = need("--load-mode");
         else if (a == "--db-mode") cfg.db_mode = need("--db-mode");
         else if (a == "--memory-limit") cfg.memory_limit = need("--memory-limit");
+        else if (a == "--threads") cfg.threads = std::atoi(need("--threads").c_str());
         else if (a == "--warmup") cfg.warmup = std::atoi(need("--warmup").c_str());
         else if (a == "--runs") cfg.runs = std::atoi(need("--runs").c_str());
         else { usage(); die("unknown arg: " + a); }
@@ -313,6 +325,7 @@ int main(int argc, char **argv) {
         die("--queries 和 --data-dir 为必填");
     if (cfg.warmup < 0) cfg.warmup = 0;
     if (cfg.runs < 1) cfg.runs = 1;
+    if (cfg.threads < 1) cfg.threads = 1;
     if (cfg.load_mode != "view" && cfg.load_mode != "mem")
         die("--load-mode 只能是 view|mem, 收到: " + cfg.load_mode);
 
@@ -362,7 +375,8 @@ int main(int argc, char **argv) {
     out += "\"load_mode\":\"" + cfg.load_mode + "\",";
     out += "\"db_mode\":\"" + db_mode + "\",";
     out += "\"warmup\":" + std::to_string(cfg.warmup) + ",";
-    out += "\"runs\":" + std::to_string(cfg.runs);
+    out += "\"runs\":" + std::to_string(cfg.runs) + ",";
+    out += "\"threads\":" + std::to_string(cfg.threads);
     out += "},";
 
     out += "\"load\":{";

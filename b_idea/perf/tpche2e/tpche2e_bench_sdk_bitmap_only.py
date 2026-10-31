@@ -23,6 +23,7 @@ baseline 与 mem 模式的 bitmap 结果混在一起。
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --load-mode mem
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --runs 5
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --queries 1,6,9,18
+  python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --threads 16
 """
 
 import argparse
@@ -57,6 +58,7 @@ BASELINES_CSV = os.path.join(OUT_DIR, "tpche2e_results.csv")
 # 计时参数
 DEFAULT_RUNS = 3
 DEFAULT_WARMUP = 1
+DEFAULT_THREADS = 16  # 固定执行线程数; 不用默认的整机核数, 否则测量抖动极大
 DEFAULT_TIMEOUT = 600
 
 LOAD_MODES = ("view", "mem")
@@ -198,7 +200,8 @@ def load_baselines_from_csv(csv_path):
 # 运行 harness (bitmap)
 # ============================================================
 def run_harness(lib_dir, data_dir, meta, bitmap, warmup, runs, queries_file,
-                load_mode="view", db_mode="auto", memory_limit=""):
+                load_mode="view", db_mode="auto", memory_limit="",
+                threads=DEFAULT_THREADS):
     env = dict(os.environ)
     existing = env.get("LD_LIBRARY_PATH", "")
     env["LD_LIBRARY_PATH"] = lib_dir + (":" + existing if existing else "")
@@ -208,6 +211,7 @@ def run_harness(lib_dir, data_dir, meta, bitmap, warmup, runs, queries_file,
            "--data-dir", data_dir,
            "--warmup", str(warmup),
            "--runs", str(runs),
+           "--threads", str(threads),
            "--load-mode", load_mode,
            "--db-mode", db_mode]
     if memory_limit:
@@ -216,7 +220,7 @@ def run_harness(lib_dir, data_dir, meta, bitmap, warmup, runs, queries_file,
         cmd += ["--bitmap", "--meta", meta]
 
     log(f"[harness] LD_LIBRARY_PATH={lib_dir}  bitmap={bitmap}  "
-        f"load_mode={load_mode}  db_mode={db_mode}")
+        f"load_mode={load_mode}  db_mode={db_mode}  threads={threads}")
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               universal_newlines=True, timeout=DEFAULT_TIMEOUT,
@@ -287,7 +291,7 @@ def fmt_speedup(base_avg, bitmap_avg):
 
 
 def write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
-              load_mode="view", db_mode="auto"):
+              load_mode="view", db_mode="auto", threads=DEFAULT_THREADS):
     rows = []
     for qnum in sorted(queries.keys()):
         qname = f"Q{qnum:02d}"
@@ -298,6 +302,7 @@ def write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
             "query": qname,
             "load_mode": load_mode,
             "db_mode": db_mode,
+            "threads": threads,
             "official_baseline_load_ms": fmt_ms(load_of(official_res, qname)),
             "official_baseline_warmup_s": fmt_seconds(ob_w),
             "official_baseline_avg_s": fmt_seconds(ob_avg),
@@ -461,7 +466,8 @@ def plot(results_rows):
 # 主流程
 # ============================================================
 def main():
-    global DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_TIMEOUT, DATA_DIR, META_PATH
+    global DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_TIMEOUT, DEFAULT_THREADS
+    global DATA_DIR, META_PATH
     ap = argparse.ArgumentParser(
         description="TPC-H 22 e2e: baseline=固定CSV, project_bitmap=SDK harness")
     ap.add_argument("--data-dir", default=DATA_DIR)
@@ -472,6 +478,10 @@ def main():
                          "(缺省按 --load-mode 自动选择 tpche2e_results[_mem].csv)")
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
+    ap.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                    help=f"DuckDB 执行线程数 (默认 {DEFAULT_THREADS}); "
+                         "不显式限制时 DuckDB 会占满整机核数, 在共享机器上会造成 "
+                         "10%~20% 的测量抖动")
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     ap.add_argument("--queries", default=None, help="只跑指定查询, 如 1,5,9")
     ap.add_argument("--load-mode", default="view", choices=list(LOAD_MODES),
@@ -487,6 +497,7 @@ def main():
     DEFAULT_RUNS = args.runs
     DEFAULT_WARMUP = args.warmup
     DEFAULT_TIMEOUT = args.timeout
+    DEFAULT_THREADS = args.threads
     DATA_DIR = args.data_dir
     META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
     set_output_paths(args.load_mode)
@@ -494,6 +505,7 @@ def main():
     db_mode = resolve_db_mode(args.load_mode, args.db_mode)
 
     log(f"[config] load_mode={args.load_mode}  db_mode={args.db_mode} -> {db_mode}"
+        f"  threads={args.threads}  warmup={args.warmup}  runs={args.runs}"
         + (f"  memory_limit={args.memory_limit}" if args.memory_limit else ""))
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -530,14 +542,14 @@ def main():
         data_dir=DATA_DIR, meta=META_PATH, bitmap=True,
         warmup=DEFAULT_WARMUP, runs=DEFAULT_RUNS, queries_file=QUERIES_RUN,
         load_mode=args.load_mode, db_mode=db_mode,
-        memory_limit=args.memory_limit)
+        memory_limit=args.memory_limit, threads=DEFAULT_THREADS)
 
     # 4) 汇总 / CSV / 画图
     log("\n" + "=" * 64)
     log("汇总")
     log("=" * 64)
     rows = write_csv(official_res, project_baseline_res, project_bitmap_res, queries,
-                     load_mode=args.load_mode, db_mode=db_mode)
+                     load_mode=args.load_mode, db_mode=db_mode, threads=DEFAULT_THREADS)
     plot(rows)
 
     ob_rows = [r for r in rows if r["official_baseline_avg_s"]]
