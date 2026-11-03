@@ -27,6 +27,21 @@ class BufferHandle;
 class ColumnDataCollection;
 struct ColumnDataAppendState;
 struct ClientConfig;
+class UnchainedHashTable;
+
+//! 每条 probe 行在 unchained hash table 上的扫描游标。
+//! 定义在这里(而不是 unchained_hash_table.hpp)是为了避免 join_hashtable.hpp 与
+//! unchained_hash_table.hpp 互相 include —— 后者需要完整的 JoinHashTable 定义。
+struct UnchainedScanState {
+	UnchainedScanState();
+
+	//! 下一条待检查的 adjacency 位置
+	unsafe_unique_array<idx_t> cursors;
+	//! 该 probe 行所在 slot 的区间上界 (exclusive)
+	unsafe_unique_array<idx_t> ends;
+	//! 该 probe 行的 hash
+	unsafe_unique_array<hash_t> hashes;
+};
 
 struct JoinHTScanState {
 public:
@@ -97,6 +112,9 @@ public:
 		idx_t last_match_count;
 		SelectionVector last_sel_vector;
 
+		//! Unchained hash table (论文复现) 的探针游标, 仅当 ht.unchained 非空时分配
+		unique_ptr<UnchainedScanState> unchained_state;
+
 		explicit ScanStructure(JoinHashTable &ht, TupleDataChunkState &key_state);
 		//! Get the next batch of data from the scan structure
 		void Next(DataChunk &keys, DataChunk &left, DataChunk &result);
@@ -135,6 +153,8 @@ public:
 	public:
 		void AdvancePointers();
 		void AdvancePointers(const SelectionVector &sel, idx_t sel_count);
+		//! Unchained hash table: 推进游标到同一 slot 内下一条 hash 相同的记录
+		void AdvanceUnchainedPointers(const SelectionVector &sel, idx_t sel_count);
 		void GatherResult(Vector &result, const SelectionVector &result_vector, const SelectionVector &sel_vector,
 		                  const idx_t count, const idx_t col_idx);
 		void GatherResult(Vector &result, const SelectionVector &sel_vector, const idx_t count, const idx_t col_idx);
@@ -286,6 +306,10 @@ public:
 	bool insert_duplicate_keys = true;
 	//! Number of probe matches
 	atomic<idx_t> total_probe_matches {0};
+
+	//! Unchained hash table (论文复现, 由 open_unchained_join 开关控制)。
+	//! 非空时 JoinHashTable::Probe / ScanStructure::AdvancePointers 走 unchained 路径。
+	unique_ptr<UnchainedHashTable> unchained;
 
 	struct {
 		mutex mj_lock;

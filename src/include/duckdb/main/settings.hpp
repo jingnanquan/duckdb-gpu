@@ -1232,6 +1232,18 @@ struct OpenPerfectJoinSetting {
 	static constexpr idx_t SettingIndex = 96;
 };
 
+struct OpenUnchainedJoinSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "open_unchained_join";
+	static constexpr const char *Description =
+	    "If true, allow PhysicalHashJoin to use the unchained hash table (bucket-sorted directory + register-blocked "
+	    "Bloom filter) instead of the regular chained hash table";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "false";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
+	static constexpr idx_t SettingIndex = 97;
+};
+
 struct OrderByNonIntegerLiteralSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "order_by_non_integer_literal";
@@ -1616,7 +1628,7 @@ struct ZstdMinStringLengthSetting {
 };
 
 struct GeneratedSettingInfo {
-	static constexpr idx_t MaxSettingIndex = 97;
+	static constexpr idx_t MaxSettingIndex = 98;
 };
 
 //===----------------------------------------------------------------------===//

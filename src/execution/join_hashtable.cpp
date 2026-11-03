@@ -8,6 +8,7 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/execution/unchained_hash_table.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
@@ -825,6 +826,18 @@ void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleD
 	if (scan_structure.count == 0) {
 		return;
 	}
+	if (unchained) {
+		// Unchained hash table (论文复现): directory + adjacency, 不走 pointer table
+		Vector hashes(LogicalType::HASH);
+		if (precomputed_hashes) {
+			hashes.Reference(*precomputed_hashes);
+		} else {
+			Hash(keys, *current_sel, scan_structure.count, hashes);
+		}
+		unchained->GetRowPointers(scan_structure, current_sel, scan_structure.count, hashes, scan_structure.pointers,
+		                          scan_structure.sel_vector);
+		return;
+	}
 	if (precomputed_hashes) {
 		GetRowPointers(keys, key_state, probe_state, *precomputed_hashes, current_sel, scan_structure.count,
 		               scan_structure.pointers, scan_structure.sel_vector, scan_structure.has_null_value_filter);
@@ -941,6 +954,10 @@ idx_t ScanStructure::ScanInnerJoin(DataChunk &keys, SelectionVector &result_vect
 }
 
 void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_count) {
+	if (unchained_state) {
+		AdvanceUnchainedPointers(sel, sel_count);
+		return;
+	}
 	if (!ht.chains_longer_than_one) {
 		this->count = 0;
 		return;

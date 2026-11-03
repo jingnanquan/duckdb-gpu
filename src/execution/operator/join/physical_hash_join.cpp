@@ -17,6 +17,7 @@
 #include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/execution/unchained_hash_table.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -155,6 +156,10 @@ public:
 		}
 		hash_table = op.InitializeHashTable(context);
 
+		// Unchained hash table (论文复现, gated by the user-facing `open_unchained_join` switch).
+		// 决策发生在 Finalize(): external 路径和 BHJ 都不走 unchained。
+		use_unchained_join = Settings::Get<OpenUnchainedJoinSetting>(context_p) && !use_bitmap_join;
+
 		// For perfect hash join (gated by the user-facing `open_perfect_join` switch).
 		const bool open_perfect_join = Settings::Get<OpenPerfectJoinSetting>(context_p);
 		bool use_perfect_hash = false;
@@ -232,6 +237,10 @@ public:
 	//! BHJ executor (module 6.4): owns the global bitmap + materialized RHS payload columns.
 	//! Only set when use_bitmap_join is true.
 	unique_ptr<BitmapJoinExecutor> bitmap_join_executor;
+
+	//! Unchained hash table (论文复现): 是否允许用 directory + adjacency 替代链式指针表。
+	//! 真正的决策在 Finalize() (external / BHJ / 空 build 都会回退到原路径)。
+	bool use_unchained_join = false;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -1023,13 +1032,36 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 		ht.Merge(*local_ht);
 	}
 	sink.local_hash_tables.clear();
+
+	//===------------------------------------------------------------------===//
+	// Unchained hash table (论文复现)
+	// 必须在 Unpartition() **之前** 构建: 它需要 sink_collection 的 radix 物理分区来
+	// 做零同步并行 (分区 p 恰好覆盖一段连续的 slot 区间)。TupleDataCollection::Combine
+	// 只是搬移 segment 指针, 所以写入 adjacency 的行地址在随后的 Unpartition() 之后
+	// 依然有效。
+	//===------------------------------------------------------------------===//
+	const bool use_unchained = sink.use_unchained_join && ht.GetSinkCollection().Count() > 0;
+	if (use_unchained) {
+		auto &partitions = ht.GetSinkCollection().GetPartitions();
+		vector<idx_t> partition_offsets(partitions.size() + 1, 0);
+		for (idx_t p = 0; p < partitions.size(); p++) {
+			partition_offsets[p + 1] = partition_offsets[p] + partitions[p]->Count();
+		}
+		ht.unchained = make_uniq<UnchainedHashTable>();
+		ht.unchained->Build(ht, partition_offsets, sink.num_threads);
+		DUCKDB_LOG(context, PhysicalOperatorLogType, *this, "PhysicalHashJoin", "UnchainedBuild",
+		           {{"rows", to_string(ht.unchained->Count())},
+		            {"slots", to_string(ht.unchained->SlotCount())},
+		            {"size", to_string(ht.unchained->SizeInBytes())}});
+	}
+
 	ht.Unpartition();
 
 	Value min;
 	Value max;
 	unique_ptr<DataChunk> filter_min_max = nullptr;
 
-	if (filter_pushdown && !sink.skip_filter_pushdown && ht.Count() > 0) {
+	if (filter_pushdown && !sink.skip_filter_pushdown && !use_unchained && ht.Count() > 0) {
 		filter_min_max = filter_pushdown->FinalizeMinMax(*sink.global_filter_state);
 		min = filter_min_max->data[0].GetValue(0);
 		max = filter_min_max->data[1].GetValue(0);
@@ -1041,8 +1073,10 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	// check for possible perfect hash table
 	// (gated by the `open_perfect_join` switch: when off, perfect_join_executor is nullptr and
 	// we skip the perfect-hash path entirely).
+	// NOTE: unchained 优先于 perfect hash join —— 两者是互斥的替代实现, 而 Build() 必须
+	// 在 Unpartition() 之前跑, 所以只能在 perfect 判定之前就定下来。
 	bool use_perfect_hash = false;
-	if (sink.perfect_join_executor) {
+	if (!use_unchained && sink.perfect_join_executor) {
 		use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, min, max);
 		if (use_perfect_hash) {
 			D_ASSERT(ht.equality_types.size() == 1);
@@ -1058,7 +1092,11 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
 		sink.perfect_join_executor.reset();
-		sink.ScheduleFinalize(pipeline, event);
+		if (!use_unchained) {
+			// 走原来的链式 pointer table (指针表分配 + 并行 Finalize 事件)
+			sink.ScheduleFinalize(pipeline, event);
+		}
+		// unchained 已经在上面同步构建完毕, 这里什么都不用做
 	}
 	sink.finalized = true;
 	if (ht.Count() == 0 && EmptyResultIfRHSIsEmpty()) {

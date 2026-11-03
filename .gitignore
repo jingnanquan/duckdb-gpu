@@ -12,6 +12,7 @@ b_idea/perf/**/*.png
 # File extensions to be ignored anywhere in the tree.
 #==============================================================================#
 # Temp files created by most text editors.
+*.pdf
 *~
 # Merge files created by git.
 *.orig

@@ -169,6 +169,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(OldImplicitCastingSetting),
     DUCKDB_SETTING(OpenBitmapJoinSetting),
     DUCKDB_SETTING(OpenPerfectJoinSetting),
+    DUCKDB_SETTING(OpenUnchainedJoinSetting),
     DUCKDB_SETTING(OrderByNonIntegerLiteralSetting),
     DUCKDB_SETTING_CALLBACK(OrderedAggregateThresholdSetting),
     DUCKDB_SETTING(PartitionedWriteFlushThresholdSetting),
